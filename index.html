@@ -556,8 +556,12 @@ document.getElementById('continueInput').addEventListener('change', async e => {
       const s = joined.lastIndexOf('KZCAP_DATA_START'), en = joined.indexOf('KZCAP_DATA_END', s);
       if(s !== -1 && en !== -1){
         const payload = JSON.parse(joined.slice(s + 16, en));
+        const oldFormat = payload.fields && ('department' in payload.fields);   // files made with the earlier layout
+        const ALIAS = { title: 'tag_problem_title', department: 'f_dept', area: 'f_zone', preparedBy: 'f_doneBy', kaizenTitle: 'tag_problem_title' };
         Object.keys(payload.fields || {}).forEach(key => {
-          const el = document.getElementById('f_' + key) || document.getElementById('tag_' + key);
+          let el;
+          if(oldFormat && ALIAS[key]) el = document.getElementById(ALIAS[key]);
+          if(!el && !(oldFormat && key === 'area')) el = document.getElementById('f_' + key) || document.getElementById('tag_' + key);
           if(el) el.value = payload.fields[key];
         });
       }
@@ -592,6 +596,31 @@ async function logToGoogleSheet(values){
     console.error('Google Sheet logging failed:', err);
     return { ok: false };
   }
+}
+
+/* ---------- Build stamp (shown after every download so you can tell which version of the page you are running) ---------- */
+const BUILD_ID = 'v4-02Oct26';
+
+/* ---------- Self-check: refuse to hand over a file that PowerPoint would reject ---------- */
+async function selfCheckPackage(zip){
+  const problems = [];
+  const parser = new DOMParser();
+  for(const name of Object.keys(zip.files)){
+    if(zip.files[name].dir || !/\.(xml|rels)$/i.test(name)) continue;
+    const txt = await zip.files[name].async('string');
+    const doc = parser.parseFromString(txt, 'application/xml');
+    if(doc.getElementsByTagName('parsererror').length) problems.push(name + ' is not well-formed XML');
+  }
+  const slide = await zip.files[SLIDE_KEY].async('string');
+  (slide.match(/<a:bodyPr\b[^>]*?(?:\/>|>[\s\S]*?<\/a:bodyPr>)/g) || []).forEach(b => {
+    if((b.match(/<a:(?:noAutofit|normAutofit|spAutoFit)\b/g) || []).length > 1) problems.push('a text box has two autofit settings');
+  });
+  const ids = [...slide.matchAll(/<p:cNvPr id="(\d+)"/g)].map(m => m[1]);
+  if(new Set(ids).size !== ids.length) problems.push('duplicate shape IDs on the slide');
+  const rels = zip.files['ppt/slides/_rels/slide1.xml.rels'] ? await zip.files['ppt/slides/_rels/slide1.xml.rels'].async('string') : '';
+  [...slide.matchAll(/r:(?:embed|id)="([^"]+)"/g)].forEach(m => { if(!rels.includes('Id="' + m[1] + '"')) problems.push('missing relationship ' + m[1]); });
+  if(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/.test(slide)) problems.push('illegal control character in slide text');
+  return problems;
 }
 
 /* ---------- Submit ---------- */
@@ -646,6 +675,9 @@ document.getElementById('submitBtn').addEventListener('click', async () => {
       }
     }
 
+    const problems = await selfCheckPackage(zip);
+    if(problems.length) throw new Error('Self-check stopped the download (' + BUILD_ID + '): ' + problems.join('; ') + '. Please send a screenshot of this message.');
+
     const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 }, mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation' });
     const fileName = `${sanitizePart(values.doneBy)}_${sanitizePart(values.dept)}_${sanitizePart(values.plant)}_${uniqueNo}.pptx`;
     const url = URL.createObjectURL(blob);
@@ -656,10 +688,10 @@ document.getElementById('submitBtn').addEventListener('click', async () => {
 
     const sheetResult = await logToGoogleSheet(values);
     status.textContent = sheetResult.skipped
-      ? `Downloaded ${fileName} ✓ (Google Sheet logging not configured)`
+      ? `Downloaded ${fileName} ✓ [build ${BUILD_ID}] (Google Sheet logging not configured)`
       : sheetResult.ok
-        ? `Downloaded ${fileName} ✓ — logged to Google Sheet ✓`
-        : `Downloaded ${fileName} ✓ (Google Sheet logging failed)`;
+        ? `Downloaded ${fileName} ✓ [build ${BUILD_ID}] — logged to Google Sheet ✓`
+        : `Downloaded ${fileName} ✓ [build ${BUILD_ID}] (Google Sheet logging failed)`;
     status.className = 'status-line ok';
   } catch(err){
     console.error(err);
