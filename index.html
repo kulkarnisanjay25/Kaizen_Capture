@@ -125,8 +125,18 @@ const TEMPLATE_BASE64 = "UEsDBBQABgAIAAAAIQBLpOz4pgEAABEIAAATAAgCW0NvbnRlbnRfVHl
 const SLIDE_KEY = 'ppt/slides/slide1.xml';
 const EXCLUDE_TAG_PATTERN = /unique\s*number/i; // this one is auto-generated, never shown as a form field
 
+/* Remove characters that are illegal in XML 1.0 (e.g. vertical-tab pasted from Word/Excel) – PowerPoint refuses the whole file if even one is present */
+function stripInvalidXml(s){
+  return String(s)
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]/g,'')
+    .replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]|[\uD800-\uDFFF]/g, m => m.length === 2 ? m : '');
+}
+/* Normalise every kind of line-break to \n, then strip illegal characters */
+function cleanText(s){
+  return stripInvalidXml(String(s).replace(/\r\n?|\u000B|\u2028|\u2029/g,'\n'));
+}
 function escapeXml(s){
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&apos;');
+  return stripInvalidXml(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&apos;');
 }
 
 /* ---------- run/paragraph model (tags split across runs/paragraphs resolve as one) ---------- */
@@ -173,7 +183,7 @@ function locateRunForOffset(runStartOffsets, flatRuns, offset){
 }
 function buildRunXml(rPr, text){ return `<a:r>${rPr}<a:t>${text}</a:t></a:r>`; }
 function buildValueRunsXml(rPr, value){
-  return String(value).split('\n').map(escapeXml).map(line => buildRunXml(rPr, line)).join('<a:br/>');
+  return cleanText(value).split('\n').map(escapeXml).map(line => buildRunXml(rPr, line)).join('<a:br/>');
 }
 function replaceTagInTxBody(txBodyXml, newValue){
   const model = buildFlatModel(txBodyXml);
@@ -240,7 +250,7 @@ async function setTagField(zip, field, value){
   const tb = block.match(tbRe)[0];
   const newTb = replaceTagInTxBody(tb, value);
   if(!newTb) return false;
-  xml = xml.replace(block, block.replace(tb, newTb));
+  xml = xml.replace(block, () => block.replace(tb, () => newTb));
   zip.file(SLIDE_KEY, xml);
   return true;
 }
@@ -273,9 +283,9 @@ async function appendValueToLabel(zip, labelText, value, separator){
   if(!runs.length) return false;
   const lastRun = runs[runs.length - 1];
   const newRunXml = `<a:r>${lastRun.rPr}<a:t>${escapeXml(separator)}</a:t></a:r>` + buildValueRunsXml(lastRun.rPr, value);
-  const newPara = firstParaMatch[0].replace(lastRun.full, lastRun.full + newRunXml);
-  const newTb = tb.replace(firstParaMatch[0], newPara);
-  const newBlock = found.block.replace(tb, newTb);
+  const newPara = firstParaMatch[0].replace(lastRun.full, () => lastRun.full + newRunXml);
+  const newTb = tb.replace(firstParaMatch[0], () => newPara);
+  const newBlock = found.block.replace(tb, () => newTb);
   xml = xml.slice(0, found.index) + newBlock + xml.slice(found.index + found.block.length);
   zip.file(SLIDE_KEY, xml);
   return true;
@@ -312,9 +322,9 @@ function replaceWholeShapeText(spBlock, value){
     rPr = runMatch ? (runMatch[1] || '') : '';
   }
   const bodyPr = ensureAutofitBodyPr(bodyPrMatch ? bodyPrMatch[0] : null);
-  const runsXml = String(value).split('\n').map(line => `<a:r>${rPr}<a:t>${escapeXml(line)}</a:t></a:r>`).join('<a:br/>');
+  const runsXml = cleanText(value).split('\n').map(line => `<a:r>${rPr}<a:t>${escapeXml(line)}</a:t></a:r>`).join('<a:br/>');
   const newTb = `<p:txBody>${bodyPr}${lstStyleMatch ? lstStyleMatch[0] : '<a:lstStyle/>'}<a:p>${pPr}${runsXml}</a:p></p:txBody>`;
-  return spBlock.replace(tbMatch[0], newTb);
+  return spBlock.replace(tbMatch[0], () => newTb);
 }
 async function setFieldText(zip, shapeName, value){
   let xml = await zip.files[SLIDE_KEY].async('string');
@@ -349,7 +359,7 @@ async function ensureContentType(zip, ext, contentType){
   const key = '[Content_Types].xml';
   let xml = await zip.files[key].async('string');
   if(!new RegExp(`Extension="${ext}"`).test(xml)){
-    xml = xml.replace('</Types>', `<Default Extension="${ext}" ContentType="${contentType}"/></Types>`);
+    xml = xml.replace('</Types>', () => `<Default Extension="${ext}" ContentType="${contentType}"/></Types>`);
     zip.file(key, xml);
   }
 }
@@ -366,7 +376,7 @@ async function addImageAsset(zip, dataUrl){
     : '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>';
   const existingIds = [...relsXml.matchAll(/Id="rId(\d+)"/g)].map(m => parseInt(m[1],10));
   const rId = 'rId' + ((existingIds.length ? Math.max(...existingIds) : 0) + 1);
-  relsXml = relsXml.replace('</Relationships>',
+  relsXml = relsXml.replace('</Relationships>', () =>
     `<Relationship Id="${rId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image${idx}.${ext}"/></Relationships>`);
   zip.file(relsKey, relsXml);
   return { rId, ext, idx };
@@ -376,7 +386,7 @@ async function insertPhotoAtCoords(zip, x, y, cx, cy, dataUrl, altTextTag){
   const { rId } = await addImageAsset(zip, dataUrl);
   const shapeId = await nextShapeIdFromXml(xml);
   const picXml = `<p:pic><p:nvPicPr><p:cNvPr id="${shapeId}" name="Photo_${altTextTag}" descr="${altTextTag}"/><p:cNvPicPr><a:picLocks noChangeAspect="1"/></p:cNvPicPr><p:nvPr/></p:nvPicPr><p:blipFill><a:blip r:embed="${rId}"/><a:stretch><a:fillRect/></a:stretch></p:blipFill><p:spPr><a:xfrm><a:off x="${x}" y="${y}"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></p:spPr></p:pic>`;
-  xml = xml.replace('</p:spTree>', picXml + '</p:spTree>');
+  xml = xml.replace('</p:spTree>', () => picXml + '</p:spTree>');
   zip.file(SLIDE_KEY, xml);
   return true;
 }
@@ -519,7 +529,7 @@ document.getElementById('continueInput').addEventListener('change', async e => {
       const nxml = await zip.files[notesKey].async('string');
       const joined = [...nxml.matchAll(/<a:t>([\s\S]*?)<\/a:t>/g)].map(m => m[1]).join('')
         .replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').replace(/&apos;/g,"'").replace(/&amp;/g,'&');
-      const s = joined.indexOf('KZCAP_DATA_START'), en = joined.indexOf('KZCAP_DATA_END');
+      const s = joined.lastIndexOf('KZCAP_DATA_START'), en = joined.indexOf('KZCAP_DATA_END', s);
       if(s !== -1 && en !== -1){
         const payload = JSON.parse(joined.slice(s + 16, en));
         Object.keys(payload.fields || {}).forEach(key => {
@@ -603,20 +613,22 @@ document.getElementById('submitBtn').addEventListener('click', async () => {
         const tbMatch = phMatch[0].match(/<p:txBody>[\s\S]*?<\/p:txBody>/);
         if(tbMatch){
           const newPara = `<a:p><a:r><a:rPr lang="en-US" sz="100"/><a:t>${escapeXml(marker)}</a:t></a:r></a:p>`;
-          const newTb = tbMatch[0].replace('</p:txBody>', newPara + '</p:txBody>');
-          nxml = nxml.replace(phMatch[0], phMatch[0].replace(tbMatch[0], newTb));
+          // remove any old Kaizen data paragraphs first, so only ONE data block ever exists
+          const cleanedTb = tbMatch[0].replace(/<a:p>(?:(?!<\/a:p>)[\s\S])*?KZCAP_DATA_START(?:(?!<\/a:p>)[\s\S])*?<\/a:p>/g, () => '');
+          const newTb = cleanedTb.replace('</p:txBody>', () => newPara + '</p:txBody>');
+          nxml = nxml.replace(phMatch[0], () => phMatch[0].replace(tbMatch[0], () => newTb));
           zip.file(notesKey, nxml);
         }
       }
     }
 
-    const blob = await zip.generateAsync({ type: 'blob', mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation' });
+    const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 6 }, mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation' });
     const fileName = `${sanitizePart(values.doneBy)}_${sanitizePart(values.dept)}_${sanitizePart(values.plant)}_${uniqueNo}.pptx`;
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url; a.download = fileName;
     document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 4000);
+    setTimeout(() => URL.revokeObjectURL(url), 120000);
 
     const sheetResult = await logToGoogleSheet(values);
     status.textContent = sheetResult.skipped
