@@ -302,10 +302,20 @@ function findShapeBlockByName(xml, name){
 }
 function ensureAutofitBodyPr(bodyPrXml){
   if(!bodyPrXml) return '<a:bodyPr><a:normAutofit/></a:bodyPr>';
-  let b = bodyPrXml.replace(/<a:(noAutofit|normAutofit|spAutoFit)\s*\/>/g, '');
-  if(/\/>\s*$/.test(b)) b = b.replace(/\/>\s*$/, '><a:normAutofit/></a:bodyPr>');
-  else b = b.replace('</a:bodyPr>', '<a:normAutofit/></a:bodyPr>');
-  return b;
+  /* Remove EVERY existing autofit element – including ones carrying attributes such as
+     <a:normAutofit fontScale="77500" lnSpcReduction="20000"/>. PowerPoint allows only ONE autofit
+     element per <a:bodyPr>; two of them = "PowerPoint can't read the file". */
+  let b = bodyPrXml
+    .replace(/<a:(?:noAutofit|normAutofit|spAutoFit)\b[^>]*\/>/g, '')
+    .replace(/<a:(?:noAutofit|normAutofit|spAutoFit)\b[^>]*>[\s\S]*?<\/a:(?:noAutofit|normAutofit|spAutoFit)>/g, '');
+  const fit = '<a:normAutofit/>';
+  if(/^<a:bodyPr\b[^>]*\/>\s*$/.test(b)){            // self-closing <a:bodyPr .../>
+    return b.replace(/\s*\/>\s*$/, '>' + fit + '</a:bodyPr>');
+  }
+  /* schema order inside bodyPr: prstTxWarp, [autofit], scene3d, sp3d, flatTx, extLst */
+  const nextChild = b.search(/<a:(?:scene3d|sp3d|flatTx|extLst)\b/);
+  if(nextChild !== -1) return b.slice(0, nextChild) + fit + b.slice(nextChild);
+  return b.replace('</a:bodyPr>', fit + '</a:bodyPr>');
 }
 function replaceWholeShapeText(spBlock, value){
   const tbMatch = spBlock.match(/<p:txBody>([\s\S]*?)<\/p:txBody>/);
@@ -320,6 +330,10 @@ function replaceWholeShapeText(spBlock, value){
     pPr = pPrMatch ? pPrMatch[0] : '';
     const runMatch = firstParaMatch[0].match(/<a:r>((?:<a:rPr[^>]*\/>)|(?:<a:rPr[^>]*>[\s\S]*?<\/a:rPr>))?<a:t>/);
     rPr = runMatch ? (runMatch[1] || '') : '';
+    if(!runMatch){   // empty template paragraph: reuse its endParaRPr formatting for the new text
+      const endMatch = firstParaMatch[0].match(/<a:endParaRPr\b[^>]*?(?:\/>|>[\s\S]*?<\/a:endParaRPr>)/);
+      if(endMatch) rPr = endMatch[0].replace(/^<a:endParaRPr\b/, '<a:rPr').replace(/<\/a:endParaRPr>$/, '</a:rPr>');
+    }
   }
   const bodyPr = ensureAutofitBodyPr(bodyPrMatch ? bodyPrMatch[0] : null);
   const runsXml = cleanText(value).split('\n').map(line => `<a:r>${rPr}<a:t>${escapeXml(line)}</a:t></a:r>`).join('<a:br/>');
@@ -494,7 +508,17 @@ function base64ToBytes(b64){
   for(let i=0;i<bin.length;i++) arr[i] = bin.charCodeAt(i);
   return arr;
 }
-async function loadTemplateZip(){ return JSZip.loadAsync(base64ToBytes(TEMPLATE_BASE64)); }
+async function loadTemplateZip(){
+  const zip = await JSZip.loadAsync(base64ToBytes(TEMPLATE_BASE64));
+  /* JSZip normally adds empty "folder" entries (ppt/, ppt/slides/ ...) whenever a file is written.
+     A genuine PowerPoint package has none, and strict Office builds can refuse such files. Switch that off. */
+  const origFile = zip.file.bind(zip);
+  zip.file = function(name, data, opts){
+    if(arguments.length === 1) return origFile(name);
+    return origFile(name, data, Object.assign({}, opts || {}, { createFolders: false }));
+  };
+  return zip;
+}
 
 let dynamicTagFields = []; // discovered {{tag}} fields, e.g. "Problem / Title"
 
